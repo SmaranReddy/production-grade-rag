@@ -439,3 +439,9 @@ Without an explicit grounding gate, the LLM will generate plausible-sounding ans
 - **PostgreSQL support with migrations**: Add Alembic migration scripts to make production database setup reproducible.
 - **Evaluation dataset management**: Decouple test cases from `evaluator.py` into a versioned JSON file to support dataset growth and regression tracking.
 - **Multi-KB federated search**: Allow queries that span more than one knowledge base with result merging.
+
+---
+
+## Author
+
+Smaran Reddy
