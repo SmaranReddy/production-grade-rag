@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(C:/Users/Asus/OneDrive/Desktop/Enterprise Knowledge RAG/.venv/Scripts/python.exe:*)"
+    ]
+  }
+}

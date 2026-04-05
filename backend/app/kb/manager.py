@@ -100,7 +100,9 @@ class KBIndex:
             vals = np.array(list(d.values()))
             mn, mx = vals.min(), vals.max()
             if mx - mn == 0:
-                return {k: 0.0 for k in d}
+                # All scores are identical (common with a single chunk).
+                # Return 1.0 if there is any signal, 0.0 if the score was already zero.
+                return {k: (1.0 if mx > 0 else 0.0) for k in d}
             return {k: (v - mn) / (mx - mn) for k, v in d.items()}
 
         vector_scores = _norm(vector_scores)

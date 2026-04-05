@@ -27,7 +27,16 @@ class Reranker:
 
             scored.append((chunk, final_score))
 
-        # 🔥 sort
-        ranked = sorted(scored, key=lambda x: x[1], reverse=True)
+        # sort
+        ranked = sorted(scored, key=lambda x: x[1], reverse=True)[:top_k]
 
-        return [c[0] for c in ranked[:top_k]]
+        # Normalize reranker scores to [0, 1] so the top chunk is 1.0
+        # and others are relative to it.  Avoids scores > 1 from the overlap bonus.
+        top_score = ranked[0][1] if ranked else 1.0
+        if top_score <= 0:
+            top_score = 1.0
+
+        return [
+            {**chunk, "score": round(score / top_score, 4)}
+            for chunk, score in ranked
+        ]

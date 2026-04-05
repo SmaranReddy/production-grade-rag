@@ -1,10 +1,6 @@
 import os
 import logging
 from groq import Groq
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 
 class AnswerGenerator:

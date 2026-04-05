@@ -1,8 +1,14 @@
 import os
-from pydantic_settings import BaseSettings
+from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parents[3] / ".env",
+        extra="ignore",
+    )
+
     # App
     APP_NAME: str = "Enterprise Knowledge Platform"
     DEBUG: bool = False
@@ -10,8 +16,8 @@ class Settings(BaseSettings):
     # Database — SQLite by default, override with postgresql+asyncpg://... for prod
     DATABASE_URL: str = "sqlite+aiosqlite:///./enterprise_kb.db"
 
-    # Auth
-    SECRET_KEY: str = "change-me-in-production-use-openssl-rand-hex-32"
+    # Auth — SECRET_KEY has no default; must be set in .env
+    SECRET_KEY: str
     ACCESS_TOKEN_EXPIRE_HOURS: int = 8
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     ALGORITHM: str = "HS256"
@@ -43,10 +49,6 @@ class Settings(BaseSettings):
 
     # LLM
     LLM_MODEL: str = "llama-3.1-8b-instant"
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
 
 
 settings = Settings()

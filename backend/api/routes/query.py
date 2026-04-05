@@ -51,11 +51,20 @@ async def _get_kb_or_404(kb_id: str, org_id: str, db: AsyncSession) -> Knowledge
 
 
 def _compute_confidence(chunks: list) -> float:
-    """Simple confidence: average of top-3 chunk scores."""
+    """
+    Weighted average of top-3 scores.
+    Weights: 0.6 / 0.3 / 0.1 — top chunk dominates.
+    Falls back gracefully for 1 or 2 chunks.
+    """
     if not chunks:
         return 0.0
-    scores = [c["score"] for c in chunks[:3]]
-    return round(sum(scores) / len(scores), 3)
+    weights = [0.6, 0.3, 0.1]
+    total_w = 0.0
+    total_s = 0.0
+    for chunk, w in zip(chunks[:3], weights):
+        total_s += chunk["score"] * w
+        total_w += w
+    return round(total_s / total_w, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -79,8 +88,10 @@ async def query_kb(
             detail="This knowledge base has no documents yet. Upload documents first.",
         )
 
-    # Cache check — keyed by kb_id + query text
+    # Cache check — keyed by kb_id + query text + (optional) selected doc_ids
     cache_key = f"{kb_id}:{body.query}"
+    if body.doc_ids:
+        cache_key += ":" + ",".join(sorted(body.doc_ids))
     cached = _cache.get(cache_key)
     if cached is not None:
         cached["request_id"] = str(uuid.uuid4())   # fresh request_id per call
@@ -96,6 +107,10 @@ async def query_kb(
     # 2. Hybrid search (FAISS + BM25)
     kb_index = kb_manager.get(kb_id)
     results = kb_index.search(query_embedding, body.query, top_k=20)
+
+    # 2a. Filter to selected documents if doc_ids were provided
+    if body.doc_ids:
+        results = [c for c in results if c.get("metadata", {}).get("doc_id") in body.doc_ids]
 
     if not results:
         raise HTTPException(
@@ -180,6 +195,9 @@ async def stream_kb(
     query_embedding = kb_manager.embed_query(body.query)
     kb_index = kb_manager.get(kb_id)
     results = kb_index.search(query_embedding, body.query, top_k=20)
+
+    if body.doc_ids:
+        results = [c for c in results if c.get("metadata", {}).get("doc_id") in body.doc_ids]
 
     if not results:
         raise HTTPException(

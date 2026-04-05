@@ -13,11 +13,11 @@ export function useAuth() {
     if (stored) setToken(stored);
   }, []);
 
-  const login = useCallback(async (username: string, password: string) => {
+  const login = useCallback(async (email: string, password: string) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await apiLogin(username, password);
+      const res = await apiLogin(email, password);
       localStorage.setItem("rag_token", res.access_token);
       setToken(res.access_token);
     } catch (e) {

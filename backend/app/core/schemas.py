@@ -112,6 +112,7 @@ class DocumentListOut(BaseModel):
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
     top_k: int = Field(default=5, ge=1, le=20)
+    doc_ids: Optional[List[str]] = None   # if set, restrict retrieval to these doc_ids
 
 
 class SourceChunk(BaseModel):

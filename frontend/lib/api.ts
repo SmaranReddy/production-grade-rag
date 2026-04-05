@@ -34,15 +34,16 @@ async function handleResponse<T>(res: Response): Promise<T> {
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 export async function login(
-  username: string,
+  email: string,
   password: string
 ): Promise<AuthResponse> {
-  const form = new URLSearchParams({ username, password });
   const res = await fetch(`${BASE}/auth/login`, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: form.toString(),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
   });
+  if (res.status === 401) throw new Error("Invalid credentials");
+  if (!res.ok) throw new Error("Server not reachable");
   return handleResponse<AuthResponse>(res);
 }
 
@@ -66,6 +67,12 @@ export async function createKB(
 }
 
 // ── Documents ─────────────────────────────────────────────────────────────────
+
+export async function listDocuments(kbId: string): Promise<Document[]> {
+  const res = await fetch(`${BASE}/kb/${kbId}/documents`, { headers: authHeaders() });
+  const data = await handleResponse<{ documents: Document[]; total: number }>(res);
+  return data.documents;
+}
 
 export async function uploadDocument(
   kbId: string,
@@ -109,12 +116,13 @@ export async function uploadDocument(
 
 export async function queryKB(
   kbId: string,
-  query: string
+  query: string,
+  docIds?: string[],
 ): Promise<QueryResponse> {
   const res = await fetch(`${BASE}/kb/${kbId}/query`, {
     method: "POST",
     headers: authHeaders(),
-    body: JSON.stringify({ query }),
+    body: JSON.stringify({ query, ...(docIds?.length ? { doc_ids: docIds } : {}) }),
   });
   if (res.status === 422) {
     throw new Error(

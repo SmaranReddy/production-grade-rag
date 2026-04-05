@@ -21,7 +21,7 @@ def _chunk_text(text: str, max_tokens: int, overlap: int) -> List[str]:
     step = max(1, max_tokens - overlap)
     for i in range(0, len(tokens), step):
         chunk_tokens = tokens[i: i + max_tokens]
-        if len(chunk_tokens) < 10:
+        if len(chunk_tokens) < 3:
             continue
         chunks.append(_tokenizer.decode(chunk_tokens))
     return chunks
