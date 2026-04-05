@@ -1,0 +1,37 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+
+# Node
+node_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
+
+# Build / cache
+dist/
+build/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Databases / vectors
+*.sqlite3
+*.db
+*.faiss
+*.index
+
+# RAG generated data (IMPORTANT)
+backend/data/
+
+# Optional: logs
+logs/
