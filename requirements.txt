@@ -15,6 +15,9 @@ sentence-transformers
 # BM25
 rank-bm25
 
+# ML utilities (TF-IDF reranking)
+scikit-learn
+
 # HTTP requests
 httpx
 

@@ -36,9 +36,14 @@ class Settings(BaseSettings):
     EMBEDDING_DIM: int = 384
 
     # Ingestion defaults
-    CHUNK_SIZE_TOKENS: int = 500
-    CHUNK_OVERLAP_TOKENS: int = 64
+    CHUNK_SIZE_TOKENS: int = 400      # target 200-500 tokens per chunk
+    CHUNK_OVERLAP_TOKENS: int = 50    # overlap 20-50 tokens
+    MIN_CHUNK_TOKENS: int = 50        # merge chunks smaller than this
     MAX_UPLOAD_MB: int = 50
+
+    # Query pipeline
+    ENABLE_QUERY_REWRITING: bool = False   # opt-in: rewrites vague queries via LLM
+    TOP_N_DOCS: int = 5                    # Stage 1: number of documents to pre-select
 
     # Rate limiting defaults (requests per minute)
     DEFAULT_RATE_LIMIT_RPM: int = 60

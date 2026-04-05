@@ -12,6 +12,16 @@ from the vector index.
 
 The manager keeps a hot cache of loaded indexes (LRU by access).
 Ingestion invalidates the cache entry so the next query reloads from disk.
+
+Two-stage retrieval:
+    Stage 1 — KBIndex.get_top_documents()
+        Score every chunk via _compute_fused_scores(), aggregate to doc level
+        (max chunk score per doc), return top N doc_ids.
+    Stage 2 — KBIndex.search(filter_doc_ids=...)
+        Re-run _compute_fused_scores() restricted to the Stage-1 doc set,
+        return top-k chunks for the reranker.
+
+Both stages share _compute_fused_scores() so the scoring logic is defined once.
 """
 
 import json
@@ -48,6 +58,18 @@ def _tokenize(text: str) -> List[str]:
     return [t for t in tokens if t not in STOPWORDS]
 
 
+def _norm_scores(d: Dict[str, float]) -> Dict[str, float]:
+    """Min-max normalise a score dict to [0, 1]. Handles empty and flat inputs."""
+    if not d:
+        return d
+    vals = np.array(list(d.values()))
+    mn, mx = vals.min(), vals.max()
+    if mx - mn == 0:
+        # All identical: 1.0 if there is signal, 0.0 if all zeros
+        return {k: (1.0 if mx > 0 else 0.0) for k in d}
+    return {k: (v - mn) / (mx - mn) for k, v in d.items()}
+
+
 # ---------------------------------------------------------------------------
 # KBIndex — wraps FAISS + BM25 + chunk metadata for one KB
 # ---------------------------------------------------------------------------
@@ -65,60 +87,156 @@ class KBIndex:
         tokenized = [_tokenize(c["text"]) for c in self.chunks]
         self.bm25 = BM25Okapi(tokenized) if tokenized else None
 
-    def search(self, query_embedding: np.ndarray, query: str, top_k: int = 10) -> List[dict]:
-        if not self.chunks:
-            return []
+    # ------------------------------------------------------------------
+    # Shared scoring kernel — used by both Stage 1 and Stage 2
+    # ------------------------------------------------------------------
 
-        results = []
+    def _compute_fused_scores(
+        self,
+        query_embedding: np.ndarray,
+        query: str,
+        eligible: Optional[set] = None,
+    ) -> Dict[str, float]:
+        """
+        Compute normalised, fused (70% vector + 30% BM25) scores for all
+        candidate chunks.
 
-        # --- Vector retrieval ---
+        Args:
+            eligible: Optional set of chunk IDs to include in results.
+                      None means all chunks are considered (Stage 1).
+                      A populated set restricts to selected-doc chunks (Stage 2).
+
+        Returns:
+            {chunk_id: fused_score} — only for chunks that pass the eligible
+            filter and appear in at least one of FAISS or BM25 top-50.
+        """
+        # --- Vector retrieval (top-50 FAISS candidates) ---
         n_candidates = min(50, len(self.chunks))
-        scores, indices = self.faiss_index.search(query_embedding, n_candidates)
+        raw_scores, indices = self.faiss_index.search(query_embedding, n_candidates)
         vector_scores: Dict[str, float] = {}
-        for score, faiss_id in zip(scores[0], indices[0]):
+        for score, faiss_id in zip(raw_scores[0], indices[0]):
             if faiss_id < 0:
                 continue
-            # Map faiss_id back to chunk
-            chunk = next((c for c in self.chunks if c.get("faiss_id") == int(faiss_id)), None)
+            chunk = next(
+                (c for c in self.chunks if c.get("faiss_id") == int(faiss_id)), None
+            )
             if chunk:
-                vector_scores[str(chunk["id"])] = float(1 / (1 + score))
+                cid = str(chunk["id"])
+                if eligible is None or cid in eligible:
+                    vector_scores[cid] = float(1 / (1 + score))
 
-        # --- BM25 retrieval ---
+        # --- BM25 retrieval (top-50 BM25 candidates) ---
         bm25_scores: Dict[str, float] = {}
         if self.bm25:
             tokenized_query = _tokenize(query)
-            raw_scores = self.bm25.get_scores(tokenized_query)
-            top_bm25 = np.argsort(raw_scores)[::-1][:50]
+            bm25_raw = self.bm25.get_scores(tokenized_query)
+            top_bm25 = np.argsort(bm25_raw)[::-1][:50]
             for idx in top_bm25:
                 cid = str(self.chunks[idx]["id"])
-                bm25_scores[cid] = float(raw_scores[idx])
+                if eligible is None or cid in eligible:
+                    bm25_scores[cid] = float(bm25_raw[idx])
 
-        # --- Normalize ---
-        def _norm(d: Dict[str, float]) -> Dict[str, float]:
-            if not d:
-                return d
-            vals = np.array(list(d.values()))
-            mn, mx = vals.min(), vals.max()
-            if mx - mn == 0:
-                # All scores are identical (common with a single chunk).
-                # Return 1.0 if there is any signal, 0.0 if the score was already zero.
-                return {k: (1.0 if mx > 0 else 0.0) for k in d}
-            return {k: (v - mn) / (mx - mn) for k, v in d.items()}
+        # --- Normalise and fuse: 70% vector + 30% BM25 ---
+        vector_scores = _norm_scores(vector_scores)
+        bm25_scores   = _norm_scores(bm25_scores)
 
-        vector_scores = _norm(vector_scores)
-        bm25_scores = _norm(bm25_scores)
-
-        # --- Fuse (alpha = 0.5) ---
-        alpha = 0.5
+        alpha = 0.7
         candidate_ids = set(vector_scores) | set(bm25_scores)
-        fused: Dict[str, float] = {
-            cid: alpha * vector_scores.get(cid, 0.0) + (1 - alpha) * bm25_scores.get(cid, 0.0)
+        return {
+            cid: alpha * vector_scores.get(cid, 0.0)
+                 + (1 - alpha) * bm25_scores.get(cid, 0.0)
             for cid in candidate_ids
         }
 
-        # --- Sort and return top_k ---
-        sorted_ids = sorted(fused, key=lambda x: fused[x], reverse=True)[:top_k]
-        for cid in sorted_ids:
+    # ------------------------------------------------------------------
+    # Stage 1 — document-level selection
+    # ------------------------------------------------------------------
+
+    def get_top_documents(
+        self,
+        query_embedding: np.ndarray,
+        query: str,
+        top_n: int = 5,
+    ) -> List[str]:
+        """
+        Return the IDs of the top_n most relevant documents.
+
+        Strategy: score every chunk via _compute_fused_scores (no filter),
+        then aggregate chunk scores to document level using the *maximum*
+        chunk score for each document.  Maximum is preferred over average
+        because a single highly relevant chunk is enough to justify including
+        the document in Stage 2.
+
+        Returns:
+            Ordered list of doc_ids (best first), length ≤ top_n.
+        """
+        if not self.chunks:
+            return []
+
+        fused = self._compute_fused_scores(query_embedding, query, eligible=None)
+
+        # Aggregate: max chunk score per document
+        doc_scores: Dict[str, float] = {}
+        for cid, score in fused.items():
+            chunk = self.chunk_map.get(cid)
+            if not chunk:
+                continue
+            doc_id = chunk.get("doc_id", "")
+            if doc_id:
+                if score > doc_scores.get(doc_id, -1.0):
+                    doc_scores[doc_id] = score
+
+        logger.debug("[Stage1] Doc scores: %s", {k: round(v, 4) for k, v in doc_scores.items()})
+
+        top_docs = sorted(doc_scores, key=lambda d: doc_scores[d], reverse=True)[:top_n]
+        logger.debug(
+            "Stage-1 doc selection | kb=%s | top_n=%d | selected=%s | scores=%s",
+            self.kb_id,
+            top_n,
+            top_docs,
+            [round(doc_scores[d], 4) for d in top_docs],
+        )
+        return top_docs
+
+    # ------------------------------------------------------------------
+    # Stage 2 — chunk-level retrieval within selected documents
+    # ------------------------------------------------------------------
+
+    def search(
+        self,
+        query_embedding: np.ndarray,
+        query: str,
+        top_k: int = 10,
+        filter_doc_ids: Optional[set] = None,
+    ) -> List[dict]:
+        """
+        Hybrid retrieval: 70% FAISS vector score + 30% BM25 score.
+
+        Args:
+            filter_doc_ids: When provided (populated by Stage 1 or by the
+                user's explicit doc selection), only chunks from those
+                documents are scored.  This is the pre-filter introduced in
+                the previous round's Task 3.
+        """
+        if not self.chunks:
+            return []
+
+        # Build eligible chunk-ID set for the chosen documents
+        if filter_doc_ids:
+            eligible: Optional[set] = {
+                str(c["id"]) for c in self.chunks
+                if c.get("doc_id") in filter_doc_ids
+            }
+            if not eligible:            # filter produced nothing — fall back
+                eligible = None
+        else:
+            eligible = None
+
+        fused = self._compute_fused_scores(query_embedding, query, eligible=eligible)
+
+        # Sort and materialise top_k results
+        results: List[dict] = []
+        for cid in sorted(fused, key=lambda x: fused[x], reverse=True)[:top_k]:
             chunk = self.chunk_map.get(cid)
             if chunk:
                 results.append({

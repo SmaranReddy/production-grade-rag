@@ -132,11 +132,25 @@ export async function queryKB(
   return handleResponse<QueryResponse>(res);
 }
 
+// ── Delete document ───────────────────────────────────────────────────────────
+
+export async function deleteDocument(kbId: string, docId: string): Promise<void> {
+  const res = await fetch(`${BASE}/kb/${kbId}/documents/${docId}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok && res.status !== 204) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body?.detail || `Delete failed (${res.status})`);
+  }
+}
+
 // ── Streaming query ───────────────────────────────────────────────────────────
 
 export async function* streamQuery(
   kbId: string,
-  query: string
+  query: string,
+  docIds?: string[],
 ): AsyncGenerator<{ token?: string; done?: boolean; sources?: QueryResponse["sources"]; confidence?: number; cache_hit?: boolean }> {
   const token = getToken();
   const res = await fetch(`${BASE}/kb/${kbId}/stream`, {
@@ -145,7 +159,7 @@ export async function* streamQuery(
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({ query }),
+    body: JSON.stringify({ query, ...(docIds?.length ? { doc_ids: docIds } : {}) }),
   });
 
   if (res.status === 422) {

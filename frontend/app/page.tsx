@@ -1,25 +1,130 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useAuth } from "@/hooks/useAuth";
-import { listKBs, createKB, queryKB, uploadDocument, listDocuments } from "@/lib/api";
+import {
+  listKBs,
+  createKB,
+  streamQuery,
+  uploadDocument,
+  listDocuments,
+  deleteDocument,
+} from "@/lib/api";
 import type { Source, Document } from "@/lib/types";
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+
+type Toast = { id: number; message: string; type: "success" | "error" | "info" };
+
+function useToast() {
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const counter = useRef(0);
+
+  const add = useCallback((message: string, type: Toast["type"] = "info") => {
+    const id = ++counter.current;
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 3500);
+  }, []);
+
+  return { toasts, add };
+}
+
+function ToastContainer({ toasts }: { toasts: Toast[] }) {
+  if (toasts.length === 0) return null;
+  const colors: Record<Toast["type"], string> = {
+    success: "bg-green-800 border-green-600 text-green-100",
+    error:   "bg-red-900   border-red-700   text-red-100",
+    info:    "bg-gray-800  border-gray-600  text-gray-100",
+  };
+  return (
+    <div className="fixed bottom-4 right-4 flex flex-col gap-2 z-50">
+      {toasts.map((t) => (
+        <div
+          key={t.id}
+          className={`border rounded px-4 py-2 text-sm shadow-lg animate-fade-in ${colors[t.type]}`}
+        >
+          {t.message}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Confidence bar ────────────────────────────────────────────────────────────
+
+function ConfidenceBar({ value }: { value: number }) {
+  const pct = Math.round(value * 100);
+  const [label, barColor, labelColor] =
+    pct > 75 ? ["High",   "bg-green-500",  "text-green-400"]  :
+    pct > 50 ? ["Medium", "bg-yellow-500", "text-yellow-400"] :
+               ["Low",    "bg-red-500",    "text-red-400"];
+  return (
+    <div className="mt-2 flex items-center gap-2">
+      <span className={`text-xs font-medium w-12 ${labelColor}`}>{label}</span>
+      <div className="flex-1 bg-gray-700 rounded-full h-1.5">
+        <div
+          className={`h-1.5 rounded-full transition-all ${barColor}`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      <span className="text-xs text-gray-400 tabular-nums w-8 text-right">{pct}%</span>
+    </div>
+  );
+}
+
+// ── Collapsible sources ───────────────────────────────────────────────────────
+
+function Sources({ sources }: { sources: Source[] }) {
+  const [open, setOpen] = useState(false);
+  if (!sources.length) return null;
+  return (
+    <div className="mt-2 border-t border-gray-700 pt-2">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="text-xs text-gray-400 hover:text-gray-200 flex items-center gap-1"
+      >
+        <span>{open ? "▾" : "▸"}</span>
+        {sources.length} source{sources.length !== 1 ? "s" : ""}
+      </button>
+      {open && (
+        <ul className="mt-1 space-y-1">
+          {sources.map((s, j) => (
+            <li
+              key={j}
+              className={`text-xs text-gray-300 rounded px-2 py-1 ${
+                j === 0
+                  ? "bg-blue-950 border-l-2 border-blue-500"
+                  : "bg-[#0f1117]"
+              }`}
+            >
+              {j === 0 && (
+                <span className="text-blue-400 font-medium mr-1.5">Top</span>
+              )}
+              {(s as any).source && (
+                <span className="text-gray-500 mr-1">[{(s as any).source}]</span>
+              )}
+              {s.text.length > 120 ? s.text.slice(0, 120) + "…" : s.text}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function Home() {
   const { token, login, loading: authLoading, error: authError } = useAuth();
-  const [email, setEmail] = useState("");
+  const [email, setEmail]       = useState("");
   const [password, setPassword] = useState("");
 
   // KB + docs
   const [kbId, setKbId] = useState<string | null>(null);
   const [docs, setDocs] = useState<Document[]>([]);
   const [uploading, setUploading] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const [uploadSuccess, setUploadSuccess] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // Tracks which doc IDs are selected for querying (default: all indexed)
   const [selectedDocs, setSelectedDocs] = useState<Set<string>>(new Set());
-  // Remembers docs already auto-selected so manual deselection isn't overridden on re-render
   const autoSelectedRef = useRef<Set<string>>(new Set());
 
   // Chat
@@ -28,29 +133,34 @@ export default function Home() {
     text: string;
     confidence?: number;
     sources?: Source[];
+    streaming?: boolean;
+    fallback?: boolean;
+    query?: string;
   }[]>([]);
-  const [input, setInput] = useState("");
-  const [chatError, setChatError] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
+  const [input, setInput]       = useState("");
+  const [sending, setSending]   = useState(false);
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
 
-  // After login: resolve or create KB, then load its documents
+  // Toasts
+  const { toasts, add: toast } = useToast();
+
+  // ── KB init ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!token) return;
     (async () => {
       try {
         const kbs = await listKBs();
         const kb = kbs.length > 0 ? kbs[0] : await createKB("Default");
-        console.log("[KB]", kbs.length > 0 ? "Using" : "Created", kb.id);
         setKbId(kb.id);
         setDocs(await listDocuments(kb.id));
       } catch (e) {
-        console.error("[KB] init failed:", e);
-        setChatError("Could not initialize knowledge base.");
+        toast("Could not initialize knowledge base.", "error");
       }
     })();
   }, [token]);
 
-  // Auto-select a doc the first time it reaches "indexed" status
+  // ── Auto-select newly indexed docs (first time only) ───────────────────────
   useEffect(() => {
     const newlyIndexed = docs.filter(
       (d) => d.status === "indexed" && !autoSelectedRef.current.has(d.id)
@@ -64,7 +174,7 @@ export default function Home() {
     newlyIndexed.forEach((d) => autoSelectedRef.current.add(d.id));
   }, [docs]);
 
-  // Poll every 3 s while any document is still processing
+  // ── Poll while any doc is processing ───────────────────────────────────────
   useEffect(() => {
     if (!kbId) return;
     const inProgress = docs.some(
@@ -72,14 +182,17 @@ export default function Home() {
     );
     if (!inProgress) return;
     const timer = setTimeout(async () => {
-      try {
-        setDocs(await listDocuments(kbId));
-      } catch {}
+      try { setDocs(await listDocuments(kbId)); } catch {}
     }, 3000);
     return () => clearTimeout(timer);
   }, [kbId, docs]);
 
-  // ── Auth screen ──────────────────────────────────────────────────────────────
+  // ── Auto-scroll to bottom on new messages ──────────────────────────────────
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  // ── Auth screen ─────────────────────────────────────────────────────────────
   if (!token) {
     return (
       <div className="flex items-center justify-center h-screen bg-[#0f1117] text-white">
@@ -98,6 +211,7 @@ export default function Home() {
             placeholder="Password"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && login(email, password)}
           />
           {authError && <p className="text-red-400 text-sm">{authError}</p>}
           <button
@@ -116,63 +230,126 @@ export default function Home() {
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !kbId) return;
-
     setUploading(true);
-    setUploadError(null);
-    setUploadSuccess(null);
-
     try {
       await uploadDocument(kbId, file);
-      setUploadSuccess(`"${file.name}" uploaded`);
+      toast(`"${file.name}" uploaded`, "success");
       setDocs(await listDocuments(kbId));
     } catch (err) {
-      setUploadError(err instanceof Error ? err.message : "Upload failed");
+      toast(err instanceof Error ? err.message : "Upload failed", "error");
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
-  const send = async () => {
-    const text = input.trim();
+  const handleDelete = async (doc: Document) => {
+    if (!kbId) return;
+    try {
+      await deleteDocument(kbId, doc.id);
+      setSelectedDocs((prev) => { const n = new Set(prev); n.delete(doc.id); return n; });
+      autoSelectedRef.current.delete(doc.id);
+      setDocs(await listDocuments(kbId));
+      toast(`"${doc.filename}" deleted`, "info");
+    } catch (err) {
+      toast(err instanceof Error ? err.message : "Delete failed", "error");
+    }
+  };
+
+  // ── Streaming send ───────────────────────────────────────────────────────────
+  const FALLBACK_RE = /don['\u2019]t have enough information/i;
+
+  // replaceIdx: when set, replaces that message index (Regenerate) instead of appending
+  const sendQuery = async (text: string, replaceIdx?: number) => {
     if (!text || !kbId || sending) return;
 
-    setMessages((prev) => [...prev, { role: "user", text }]);
-    setInput("");
+    if (replaceIdx === undefined) {
+      setMessages((prev) => [...prev, { role: "user", text }]);
+    }
     setSending(true);
-    setChatError(null);
 
-    console.log("[Query] POST /kb/" + kbId + "/query  body:", { query: text });
+    setMessages((prev) => {
+      const next = [...prev];
+      const placeholder = { role: "assistant", text: "", streaming: true };
+      if (replaceIdx !== undefined) next[replaceIdx] = placeholder;
+      else next.push(placeholder);
+      return next;
+    });
 
     try {
       const docIds = docs
         .filter((d) => d.status === "indexed" && selectedDocs.has(d.id))
         .map((d) => d.id);
-      console.log("[Query] selected doc_ids:", docIds);
-      const res = await queryKB(kbId, text, docIds);
-      console.log("[Query] Response:", res);
-      setMessages((prev) => [
-        ...prev,
-        {
+
+      let accumulated = "";
+      let finalSources: Source[] | undefined;
+      let finalConfidence: number | undefined;
+
+      for await (const chunk of streamQuery(kbId, text, docIds)) {
+        // extract metadata BEFORE breaking — the done event carries sources + confidence
+        if (chunk.sources)    finalSources    = chunk.sources;
+        if (chunk.confidence !== undefined) finalConfidence = chunk.confidence;
+        if (chunk.done) break;
+        if (chunk.token) {
+          accumulated += chunk.token;
+          setMessages((prev) => {
+            const next = [...prev];
+            const idx = replaceIdx ?? next.length - 1;
+            next[idx] = { role: "assistant", text: accumulated, streaming: true };
+            return next;
+          });
+        }
+      }
+
+      const isFallback = FALLBACK_RE.test(accumulated);
+      if (isFallback) finalConfidence = 0;
+
+      setMessages((prev) => {
+        const next = [...prev];
+        const idx = replaceIdx ?? next.length - 1;
+        next[idx] = {
           role: "assistant",
-          text: res.answer,
-          confidence: res.confidence,
-          sources: res.sources,
-        },
-      ]);
+          text: accumulated,
+          confidence: finalConfidence,
+          sources: finalSources,
+          streaming: false,
+          fallback: isFallback,
+          query: text,
+        };
+        return next;
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Request failed";
-      console.error("[Query] Error:", msg);
-      setChatError(msg);
+      setMessages((prev) => {
+        const next = [...prev];
+        const idx = replaceIdx ?? next.length - 1;
+        next[idx] = { role: "assistant", text: `Error: ${msg}` };
+        return next;
+      });
+      toast(msg, "error");
     } finally {
       setSending(false);
     }
   };
 
-  const hasIndexedDocs = docs.some((d) => d.status === "indexed");
-  const hasSelection = docs.some((d) => d.status === "indexed" && selectedDocs.has(d.id));
+  const send = () => {
+    const text = input.trim();
+    if (!text) return;
+    setInput("");
+    sendQuery(text);
+  };
 
-  // ── Status badge helper ───────────────────────────────────────────────────────
+  const copyText = (text: string, idx: number) => {
+    navigator.clipboard.writeText(text).then(() => {
+      setCopiedIdx(idx);
+      setTimeout(() => setCopiedIdx(null), 1500);
+    });
+  };
+
+  const hasIndexedDocs = docs.some((d) => d.status === "indexed");
+  const hasSelection   = docs.some((d) => d.status === "indexed" && selectedDocs.has(d.id));
+
+  // ── Status badge ─────────────────────────────────────────────────────────────
   const statusBadge = (status: string) => {
     const styles: Record<string, string> = {
       indexed:    "bg-green-900 text-green-300",
@@ -188,11 +365,12 @@ export default function Home() {
     );
   };
 
-  // ── Main layout ───────────────────────────────────────────────────────────────
+  // ── Layout ────────────────────────────────────────────────────────────────────
   return (
     <div className="flex h-screen bg-[#0f1117] text-white">
+      <ToastContainer toasts={toasts} />
 
-      {/* ── Sidebar: documents ─────────────────────────────────────────────── */}
+      {/* ── Sidebar ─────────────────────────────────────────────────────────── */}
       <aside className="w-64 flex-shrink-0 border-r border-gray-800 flex flex-col p-3 gap-3">
         <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
           Documents
@@ -211,22 +389,12 @@ export default function Home() {
                        file:rounded file:border-0 file:bg-blue-600 file:text-white
                        file:text-xs file:cursor-pointer disabled:opacity-50 cursor-pointer"
           />
-          {uploading && (
-            <p className="text-xs text-gray-400 italic">Uploading...</p>
-          )}
-          {uploadSuccess && (
-            <p className="text-xs text-green-400">{uploadSuccess}</p>
-          )}
-          {uploadError && (
-            <p className="text-xs text-red-400">{uploadError}</p>
-          )}
+          {uploading && <p className="text-xs text-gray-400 italic">Uploading…</p>}
         </div>
 
         {/* Document list */}
         <div className="flex-1 overflow-y-auto flex flex-col gap-1">
-          {!kbId && (
-            <p className="text-xs text-gray-500 italic">Initializing...</p>
-          )}
+          {!kbId && <p className="text-xs text-gray-500 italic">Initializing…</p>}
           {kbId && docs.length === 0 && (
             <p className="text-xs text-gray-500 italic">No documents yet.</p>
           )}
@@ -234,14 +402,14 @@ export default function Home() {
             const isIndexed = doc.status === "indexed";
             const isChecked = selectedDocs.has(doc.id);
             return (
-              <label
+              <div
                 key={doc.id}
-                className={`bg-[#1a1d27] rounded px-2 py-1.5 flex items-start gap-2 cursor-pointer
-                  ${isIndexed ? "hover:bg-[#22263a]" : "opacity-60 cursor-default"}`}
+                className={`bg-[#1a1d27] rounded px-2 py-1.5 flex items-start gap-2
+                  ${isIndexed ? "hover:bg-[#22263a]" : "opacity-60"}`}
               >
                 <input
                   type="checkbox"
-                  className="mt-0.5 accent-blue-500"
+                  className="mt-0.5 accent-blue-500 flex-shrink-0"
                   checked={isChecked}
                   disabled={!isIndexed}
                   onChange={() => {
@@ -252,19 +420,26 @@ export default function Home() {
                     });
                   }}
                 />
-                <div className="flex flex-col gap-0.5 min-w-0">
+                <div className="flex flex-col gap-0.5 min-w-0 flex-1">
                   <span className="text-xs text-gray-200 truncate" title={doc.filename}>
                     {doc.filename}
                   </span>
                   {statusBadge(doc.status)}
                 </div>
-              </label>
+                <button
+                  onClick={() => handleDelete(doc)}
+                  title="Delete document"
+                  className="text-gray-600 hover:text-red-400 text-xs flex-shrink-0 mt-0.5 leading-none"
+                >
+                  ✕
+                </button>
+              </div>
             );
           })}
         </div>
       </aside>
 
-      {/* ── Chat ───────────────────────────────────────────────────────────── */}
+      {/* ── Chat ────────────────────────────────────────────────────────────── */}
       <div className="flex-1 flex flex-col">
         <div className="flex-1 overflow-y-auto p-4 space-y-3">
           {!hasIndexedDocs && kbId && (
@@ -285,58 +460,72 @@ export default function Home() {
                 m.role === "user" ? "ml-auto bg-blue-700" : "bg-[#1a1d27]"
               }`}
             >
-              <p>{m.text}</p>
+              {/* Copy button — shown after streaming finishes */}
+              {m.role === "assistant" && !m.streaming && (
+                <div className="flex justify-end mb-1">
+                  <button
+                    onClick={() => copyText(m.text, i)}
+                    className="text-xs text-gray-600 hover:text-gray-300 transition-colors"
+                  >
+                    {copiedIdx === i ? "Copied!" : "Copy"}
+                  </button>
+                </div>
+              )}
 
-              {m.role === "assistant" && m.confidence !== undefined && (
-                <p className="mt-2 text-xs text-gray-400">
-                  Confidence: {m.confidence.toFixed(2)}
+              {m.role === "assistant" && m.fallback ? (
+                <p className="text-yellow-400 text-sm flex items-center gap-1.5">
+                  <span>⚠</span> No relevant information found in selected documents.
+                </p>
+              ) : (
+                <p className="whitespace-pre-wrap">
+                  {m.text}
+                  {/* Blinking block cursor while streaming */}
+                  {m.streaming && (
+                    <span className="animate-blink text-gray-400 ml-0.5">▍</span>
+                  )}
                 </p>
               )}
 
-              {m.role === "assistant" && m.sources && m.sources.length > 0 && (
-                <div className="mt-2 border-t border-gray-700 pt-2">
-                  <p className="text-xs text-gray-400 mb-1">Sources:</p>
-                  <ul className="space-y-1">
-                    {m.sources.map((s, j) => (
-                      <li
-                        key={j}
-                        className="text-xs text-gray-300 bg-[#0f1117] rounded px-2 py-1"
-                      >
-                        {(s as any).source && (
-                          <span className="text-gray-500 mr-1">
-                            [{(s as any).source}]
-                          </span>
-                        )}
-                        {s.text.length > 120 ? s.text.slice(0, 120) + "…" : s.text}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+              {m.role === "assistant" && !m.streaming && m.confidence !== undefined && (
+                <ConfidenceBar value={m.confidence} />
+              )}
+
+              {m.role === "assistant" && !m.streaming && m.sources && m.sources.length > 0 && (
+                <>
+                  <p className="mt-2 text-xs text-gray-500">
+                    Using {m.sources.length} source{m.sources.length !== 1 ? "s" : ""}
+                  </p>
+                  <Sources sources={m.sources} />
+                </>
+              )}
+
+              {m.role === "assistant" && !m.streaming && m.query && (
+                <button
+                  onClick={() => sendQuery(m.query!, i)}
+                  disabled={sending}
+                  className="mt-2 text-xs text-gray-500 hover:text-gray-300 disabled:opacity-40"
+                >
+                  ↻ Regenerate
+                </button>
               )}
             </div>
           ))}
 
-          {sending && (
-            <div className="max-w-xl px-4 py-2 rounded bg-[#1a1d27] text-gray-400 italic">
-              Thinking...
-            </div>
-          )}
-          {chatError && (
-            <p className="text-red-400 text-sm text-center">{chatError}</p>
-          )}
+          {/* anchor for auto-scroll */}
+          <div ref={bottomRef} />
         </div>
 
         <div className="flex gap-2 p-4 border-t border-gray-800">
           <input
             className="flex-1 bg-[#1a1d27] border border-gray-700 rounded px-3 py-2 outline-none disabled:opacity-50"
             placeholder={
-              !hasIndexedDocs ? "Upload a document first..." :
-              !hasSelection   ? "Select a document first..." :
-                                "Ask something..."
+              !hasIndexedDocs ? "Upload a document first…" :
+              !hasSelection   ? "Select a document first…" :
+                                "Ask something…"
             }
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && send()}
+            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && send()}
             disabled={!hasSelection || sending}
           />
           <button
@@ -344,7 +533,7 @@ export default function Home() {
             onClick={send}
             disabled={!hasSelection || sending}
           >
-            {sending ? "..." : "Send"}
+            {sending ? "…" : "Send"}
           </button>
         </div>
       </div>

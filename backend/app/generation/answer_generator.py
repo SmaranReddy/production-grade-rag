@@ -2,6 +2,8 @@ import os
 import logging
 from groq import Groq
 
+logger = logging.getLogger(__name__)
+
 
 class AnswerGenerator:
     def __init__(self, api_key: str = None):
@@ -89,3 +91,38 @@ Answer:
         except Exception as e:
             logging.error("❌ Streaming error: %s", str(e))
             yield "Error generating response."
+
+    # ─── Query Rewriting (Task 5) ────────────────────────────────────────────
+
+    def rewrite_query(self, query: str) -> str:
+        """
+        Expand a short or vague query into a more specific retrieval query.
+
+        Example:
+            "leave policy"
+            → "employee annual leave policy entitlement company rules"
+
+        Returns the original query unchanged on any error or empty output.
+        Uses a single short LLM call (max_tokens=64) to keep latency low.
+        """
+        prompt = (
+            "Rewrite the following search query to be more specific and descriptive "
+            "for retrieving relevant enterprise documents. "
+            "Output only the rewritten query — no explanation, no quotes.\n\n"
+            f"Original query: {query}\n"
+            "Rewritten query:"
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=64,
+            )
+            rewritten = response.choices[0].message.content.strip()
+            # Sanity checks: non-empty, not excessively long, not a refusal
+            if rewritten and len(rewritten) <= 300 and len(rewritten) >= len(query) // 2:
+                return rewritten
+        except Exception as exc:
+            logger.warning("Query rewriting failed, using original query: %s", exc)
+        return query
